@@ -721,21 +721,23 @@ def setup_bitnet(params: "MiniAGIParams") -> str:
 
 
 class BitNetCoder:
-    """Code synthesis via live BitNet; tiny template only as last-resort stub."""
+    """Code synthesis via live BitNet; domain stubs when BitNet weights are offline."""
 
     LANG_ALIASES = {
         "c": "c", "c++": "cpp", "cpp": "cpp", "python": "python", "py": "python",
         "javascript": "javascript", "js": "javascript", "go": "go", "rust": "rust",
         "java": "java", "bash": "bash", "shell": "bash",
+        "html": "html", "htm": "html",
     }
 
-    def __init__(self, engine: BitNetEngine | None = None):
+    def __init__(self, engine: BitNetEngine | None = None, work_dir: str | Path | None = None):
         self.engine = engine
+        self.work_dir = Path(work_dir) if work_dir else Path.cwd()
 
     @classmethod
     def is_coding_request(cls, text: str) -> bool:
         q = text.lower()
-        if any(w in q for w in ("write", "implement", "code", "program", "print", "hello")):
+        if any(w in q for w in ("write", "implement", "code", "program", "print", "hello", "game", "chess")):
             return True
         return any(re.search(rf"\bin\s+{re.escape(a)}\b", q) for a in cls.LANG_ALIASES)
 
@@ -745,6 +747,8 @@ class BitNetCoder:
         for alias in sorted(cls.LANG_ALIASES, key=len, reverse=True):
             if re.search(rf"\bin\s+{re.escape(alias)}\b", q):
                 return cls.LANG_ALIASES[alias]
+        if "python" in q or "py" in q:
+            return "python"
         return "python"
 
     @classmethod
@@ -764,19 +768,50 @@ class BitNetCoder:
         )
         return re.sub(r"\s+", " ", cleaned).strip(" .") or "hello"
 
+    @staticmethod
+    def extract_fenced_code(text: str) -> tuple[str, str]:
+        """Return (lang, code) from first markdown fence, else ('', full text)."""
+        m = re.search(r"```(\w+)?\n([\s\S]*?)```", text)
+        if not m:
+            return "", (text or "").strip()
+        return (m.group(1) or "text").strip(), m.group(2).strip("\n") + "\n"
+
+    @classmethod
+    def default_filename(cls, objective: str, lang: str) -> str:
+        q = objective.lower()
+        if "chess" in q:
+            if lang == "c":
+                return "chess.c"
+            if lang == "html":
+                return "chess.html"
+            return "chess.py" if lang in {"", "python", "py"} else f"chess.{lang}"
+        if "hello" in q and lang == "c":
+            return "hello_cat.c"
+        if lang == "html":
+            return "hello_cat.html" if "hello" in q else "index.html"
+        if lang in {"c", "cpp"}:
+            return "main.c" if lang == "c" else "main.cpp"
+        if lang == "go":
+            return "main.go"
+        if lang == "rust":
+            return "main.rs"
+        if lang in {"javascript", "js"}:
+            return "main.js"
+        return "main.py"
+
     def synthesize(self, text: str) -> str:
         if self.engine and self.engine.is_live:
             lang = self.detect_lang(text)
             prompt = (
-                f"Write a complete, minimal {lang} program for this request. "
+                f"Write a complete, runnable {lang} program for this request. "
                 f"Reply with a short observation line, then a fenced ```{lang} code block only.\n"
                 f"Request: {text}"
             )
             try:
                 out = self.engine.generate(
                     prompt,
-                    n_predict=max(128, self.engine.params.bitnet_n_predict),
-                    system="You are CatSeek R1 BitNet coder. Output code, not chat fluff.",
+                    n_predict=max(512, self.engine.params.bitnet_n_predict),
+                    system="You are CatSeek R1 BitNet coder. Output complete runnable code.",
                 )
                 if "```" in out:
                     return f"Observation: BitNet ({self.engine.backend}) code.\n\n{out}"
@@ -788,22 +823,109 @@ class BitNetCoder:
                 return self._stub(text) + f"\n\n[BitNet error → stub: {exc}]"
         return self._stub(text)
 
+    def deliver(self, objective: str, observation: str) -> tuple[str, Path | None]:
+        """Write code to WORK_DIR (file:// on device) and print it to the terminal."""
+        lang, code = self.extract_fenced_code(observation)
+        if not code.strip():
+            print("\n===== CatSeek R1 · no code block to print =====\n", flush=True)
+            print(observation, flush=True)
+            return observation, None
+        if not lang or lang == "text":
+            lang = self.detect_lang(objective)
+        name = self.default_filename(objective, lang)
+        candidates = [self.work_dir, _ROOT / "work", Path.cwd()]
+        path = None
+        last_err = None
+        for base in candidates:
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+                candidate = base / name
+                candidate.write_text(code, encoding="utf-8")
+                path = candidate
+                break
+            except OSError as exc:
+                last_err = exc
+                continue
+        if path is None:
+            file_url = ""
+            saved = f"(could not write file: {last_err})"
+        else:
+            file_url = path.resolve().as_uri()
+            saved = str(path.resolve())
+        banner = (
+            f"\n===== CatSeek R1 · CODE ({lang}) =====\n"
+            f"# saved: {saved}\n"
+            f"# open:  {file_url or '(n/a)'}\n"
+            f"{code}"
+            f"===== end CODE =====\n"
+        )
+        print(banner, flush=True)
+        note = (
+            f"\n\n[printed to terminal]\n"
+            f"[saved on device] {saved}\n"
+            f"[file url] {file_url or '(n/a)'}"
+        )
+        if path and lang == "python":
+            note += f"\n[run] python3 \"{path}\""
+        elif path and lang == "c":
+            note += f"\n[run] cc \"{path}\" -o /tmp/a.out && /tmp/a.out"
+        elif path and lang == "html":
+            note += f"\n[open] open \"{path}\""
+        return observation.rstrip() + note, path
+
     @classmethod
     def _stub(cls, text: str) -> str:
         lang = cls.detect_lang(text)
-        msg = cls._extract_message(text).replace('"', '\\"')
+        q = text.lower()
+        if "chess" in q and lang == "python":
+            code = cls._chess_py()
+            return (
+                "Observation: terminal chess game in Python 3 "
+                "(stub while BitNet weights offline).\n\n"
+                f"```python\n{code}```"
+            )
+        if "chess" in q and lang == "c":
+            code = cls._chess_c()
+            return (
+                "Observation: terminal chess starter in C "
+                "(stub while BitNet weights offline).\n\n"
+                f"```c\n{code}```"
+            )
+        msg = cls._extract_message(text)
+        if lang == "html":
+            safe = (
+                msg.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            code = (
+                "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+                "  <meta charset=\"utf-8\">\n"
+                f"  <title>{safe}</title>\n"
+                "  <style>body{font-family:system-ui;display:grid;place-items:center;"
+                "min-height:100vh;margin:0;background:#111;color:#f5f5f5}"
+                "h1{font-size:clamp(2rem,8vw,5rem)}</style>\n"
+                "</head>\n<body>\n"
+                f"  <h1>{safe}</h1>\n"
+                "</body>\n</html>\n"
+            )
+            return (
+                f"Observation: HTML page for `{msg}`.\n\n"
+                f"```html\n{code}```"
+            )
+        msg_c = msg.replace('"', '\\"')
         if lang == "c":
             code = (
                 f'#include <stdio.h>\n\nint main(void) {{\n'
-                f'    printf("{msg}\\n");\n    return 0;\n}}\n'
+                f'    printf("{msg_c}\\n");\n    return 0;\n}}\n'
             )
         elif lang == "go":
             code = (
                 f'package main\n\nimport "fmt"\n\n'
-                f'func main() {{\n    fmt.Println("{msg}")\n}}\n'
+                f'func main() {{\n    fmt.Println("{msg_c}")\n}}\n'
             )
         elif lang == "rust":
-            code = f'fn main() {{\n    println!("{msg}");\n}}\n'
+            code = f'fn main() {{\n    println!("{msg_c}");\n}}\n'
         else:
             lang = "python"
             code = f"print('{msg.replace(chr(39), chr(92)+chr(39))}')\n"
@@ -812,6 +934,343 @@ class BitNetCoder:
             f"Run --setup-bitnet for real microsoft/bitnet-b1.58-2B-4T.\n\n"
             f"```{lang}\n{code}```"
         )
+
+    @staticmethod
+    def _chess_c() -> str:
+        return r'''#include <stdio.h>
+
+/* Minimal C chess board printer — expand later for full rules. */
+static const char *START[8] = {
+    "rnbqkbnr",
+    "pppppppp",
+    "........",
+    "........",
+    "........",
+    "........",
+    "PPPPPPPP",
+    "RNBQKBNR",
+};
+
+static void print_board(void) {
+    int r, c;
+    puts("  a b c d e f g h");
+    for (r = 0; r < 8; r++) {
+        printf("%d ", 8 - r);
+        for (c = 0; c < 8; c++) {
+            char ch = START[r][c];
+            printf("%c ", ch == '.' ? '.' : ch);
+        }
+        printf("%d\n", 8 - r);
+    }
+    puts("  a b c d e f g h");
+}
+
+int main(void) {
+    puts("CatSeek chess (C) — starting position");
+    print_board();
+    puts("hello cat — compile with: cc chess.c -o chess && ./chess");
+    return 0;
+}
+'''
+
+    @staticmethod
+    def _chess_py() -> str:
+        # Compact playable terminal chess (Python 3) — printed to stdout via deliver().
+        return r'''#!/usr/bin/env python3
+"""Minimal terminal chess — Python 3. Moves like e2e4, O-O, O-O-O, resign."""
+
+from __future__ import annotations
+
+import re
+
+FILES = "abcdefgh"
+UNICODE = {
+    "K": "♔", "Q": "♕", "R": "♖", "B": "♗", "N": "♘", "P": "♙",
+    "k": "♚", "q": "♛", "r": "♜", "b": "♝", "n": "♞", "p": "♟",
+    ".": "·",
+}
+
+
+def new_board():
+    return [
+        list("rnbqkbnr"),
+        list("pppppppp"),
+        list("........"),
+        list("........"),
+        list("........"),
+        list("........"),
+        list("PPPPPPPP"),
+        list("RNBQKBNR"),
+    ]
+
+
+def in_bounds(r, c):
+    return 0 <= r < 8 and 0 <= c < 8
+
+
+def parse_sq(s):
+    s = s.strip().lower()
+    if len(s) != 2 or s[0] not in FILES or s[1] not in "12345678":
+        raise ValueError(f"bad square: {s}")
+    return 8 - int(s[1]), FILES.index(s[0])
+
+
+def sq_name(r, c):
+    return f"{FILES[c]}{8 - r}"
+
+
+def piece_color(p):
+    if p == ".":
+        return None
+    return "w" if p.isupper() else "b"
+
+
+def find_king(board, color):
+    target = "K" if color == "w" else "k"
+    for r in range(8):
+        for c in range(8):
+            if board[r][c] == target:
+                return r, c
+    return None
+
+
+def ray_hits(board, r, c, dr, dc, enemy):
+    r += dr
+    c += dc
+    while in_bounds(r, c):
+        p = board[r][c]
+        if p == ".":
+            r += dr
+            c += dc
+            continue
+        return piece_color(p) == enemy and p.lower() in "qrb" and (
+            (p.lower() == "q")
+            or (p.lower() == "r" and (dr == 0 or dc == 0))
+            or (p.lower() == "b" and dr != 0 and dc != 0)
+        )
+    return False
+
+
+def square_attacked(board, r, c, by_color):
+    enemy = by_color
+    # pawns
+    pr = 1 if enemy == "w" else -1
+    for dc in (-1, 1):
+        rr, cc = r + pr, c + dc
+        if in_bounds(rr, cc) and board[rr][cc] == ("P" if enemy == "w" else "p"):
+            return True
+    # knights
+    for dr, dc in ((-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)):
+        rr, cc = r + dr, c + dc
+        if in_bounds(rr, cc) and board[rr][cc] == ("N" if enemy == "w" else "n"):
+            return True
+    # king
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            rr, cc = r + dr, c + dc
+            if in_bounds(rr, cc) and board[rr][cc] == ("K" if enemy == "w" else "k"):
+                return True
+    # sliding
+    for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+        if ray_hits(board, r, c, dr, dc, enemy):
+            return True
+    return False
+
+
+def in_check(board, color):
+    k = find_king(board, color)
+    if not k:
+        return True
+    return square_attacked(board, k[0], k[1], "b" if color == "w" else "w")
+
+
+def clone(board):
+    return [row[:] for row in board]
+
+
+def apply_move(board, fr, fc, tr, tc, promo="Q"):
+    b = clone(board)
+    piece = b[fr][fc]
+    b[tr][tc] = piece
+    b[fr][fc] = "."
+    if piece in "Pp" and tr in (0, 7):
+        b[tr][tc] = promo if piece == "P" else promo.lower()
+    # castling rook move
+    if piece in "Kk" and abs(tc - fc) == 2:
+        if tc == 6:  # king side
+            b[tr][5] = b[tr][7]
+            b[tr][7] = "."
+        elif tc == 2:  # queen side
+            b[tr][3] = b[tr][0]
+            b[tr][0] = "."
+    return b
+
+
+def pawn_moves(board, r, c, color):
+    moves = []
+    direction = -1 if color == "w" else 1
+    start = 6 if color == "w" else 1
+    rr = r + direction
+    if in_bounds(rr, c) and board[rr][c] == ".":
+        moves.append((rr, c))
+        rr2 = r + 2 * direction
+        if r == start and board[rr2][c] == ".":
+            moves.append((rr2, c))
+    for dc in (-1, 1):
+        cc = c + dc
+        if in_bounds(rr, cc) and piece_color(board[rr][cc]) not in (None, color):
+            moves.append((rr, cc))
+    return moves
+
+
+def sliding_moves(board, r, c, color, dirs):
+    moves = []
+    for dr, dc in dirs:
+        rr, cc = r + dr, c + dc
+        while in_bounds(rr, cc):
+            col = piece_color(board[rr][cc])
+            if col is None:
+                moves.append((rr, cc))
+            else:
+                if col != color:
+                    moves.append((rr, cc))
+                break
+            rr += dr
+            cc += dc
+    return moves
+
+
+def piece_moves(board, r, c):
+    p = board[r][c]
+    color = piece_color(p)
+    if not color:
+        return []
+    pl = p.lower()
+    if pl == "p":
+        return pawn_moves(board, r, c, color)
+    if pl == "n":
+        out = []
+        for dr, dc in ((-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)):
+            rr, cc = r + dr, c + dc
+            if in_bounds(rr, cc) and piece_color(board[rr][cc]) != color:
+                out.append((rr, cc))
+        return out
+    if pl == "b":
+        return sliding_moves(board, r, c, color, ((1, 1), (1, -1), (-1, 1), (-1, -1)))
+    if pl == "r":
+        return sliding_moves(board, r, c, color, ((1, 0), (-1, 0), (0, 1), (0, -1)))
+    if pl == "q":
+        return sliding_moves(
+            board, r, c, color,
+            ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)),
+        )
+    if pl == "k":
+        out = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                rr, cc = r + dr, c + dc
+                if in_bounds(rr, cc) and piece_color(board[rr][cc]) != color:
+                    out.append((rr, cc))
+        # castling (no check history — simplified: empty path + not in check)
+        if not in_check(board, color):
+            row = 7 if color == "w" else 0
+            rook = "R" if color == "w" else "r"
+            if r == row and c == 4:
+                if board[row][5] == board[row][6] == "." and board[row][7] == rook:
+                    if not square_attacked(board, row, 5, "b" if color == "w" else "w") and not square_attacked(
+                        board, row, 6, "b" if color == "w" else "w"
+                    ):
+                        out.append((row, 6))
+                if board[row][1] == board[row][2] == board[row][3] == "." and board[row][0] == rook:
+                    if not square_attacked(board, row, 3, "b" if color == "w" else "w") and not square_attacked(
+                        board, row, 2, "b" if color == "w" else "w"
+                    ):
+                        out.append((row, 2))
+        return out
+    return []
+
+
+def legal_moves(board, color):
+    moves = []
+    for r in range(8):
+        for c in range(8):
+            if piece_color(board[r][c]) != color:
+                continue
+            for tr, tc in piece_moves(board, r, c):
+                nxt = apply_move(board, r, c, tr, tc)
+                if not in_check(nxt, color):
+                    moves.append((r, c, tr, tc))
+    return moves
+
+
+def render(board):
+    print("\n    a b c d e f g h")
+    print("  +-----------------+")
+    for r in range(8):
+        cells = " ".join(UNICODE.get(board[r][c], board[r][c]) for c in range(8))
+        print(f"{8 - r} | {cells} | {8 - r}")
+    print("  +-----------------+")
+    print("    a b c d e f g h\n")
+
+
+def parse_move(text, board, color):
+    text = text.strip()
+    if text.lower() in {"o-o", "0-0"}:
+        row = 7 if color == "w" else 0
+        return row, 4, row, 6
+    if text.lower() in {"o-o-o", "0-0-0"}:
+        row = 7 if color == "w" else 0
+        return row, 4, row, 2
+    m = re.match(r"^([a-h][1-8])([a-h][1-8])([qrbn])?$", text.lower())
+    if not m:
+        raise ValueError("use e2e4 / O-O / O-O-O / resign")
+    fr, fc = parse_sq(m.group(1))
+    tr, tc = parse_sq(m.group(2))
+    return fr, fc, tr, tc
+
+
+def main():
+    board = new_board()
+    turn = "w"
+    print("CatSeek terminal chess. Moves: e2e4, O-O, O-O-O, resign, help")
+    while True:
+        render(board)
+        side = "White" if turn == "w" else "Black"
+        if in_check(board, turn):
+            print(f"{side} is in check.")
+        legal = legal_moves(board, turn)
+        if not legal:
+            print("Checkmate!" if in_check(board, turn) else "Stalemate!")
+            break
+        raw = input(f"{side}> ").strip()
+        if not raw:
+            continue
+        low = raw.lower()
+        if low in {"resign", "quit", "exit"}:
+            print(f"{side} resigns.")
+            break
+        if low == "help":
+            print("Enter from-to squares like e2e4. Castling: O-O / O-O-O.")
+            continue
+        try:
+            fr, fc, tr, tc = parse_move(raw, board, turn)
+        except ValueError as exc:
+            print(exc)
+            continue
+        if (fr, fc, tr, tc) not in legal:
+            print("Illegal move.")
+            continue
+        board = apply_move(board, fr, fc, tr, tc)
+        turn = "b" if turn == "w" else "w"
+
+
+if __name__ == "__main__":
+    main()
+'''
 
 
 # ---------------------------------------------------------------------------
@@ -913,7 +1372,7 @@ class CatSeekR1MiniAGI:
         self.reasoning_effort = params.reasoning_effort
 
         self.engine = BitNetEngine(params)
-        self.coder = BitNetCoder(self.engine)
+        self.coder = BitNetCoder(self.engine, work_dir=self.work_dir)
         self.summarized_history = ""
         self.action_memory: list[str] = []
         self.criticism = ""
@@ -923,6 +1382,8 @@ class CatSeekR1MiniAGI:
         self.step = 0
         self.last_observation = ""
         self.pending_user_gate = False  # PROMPT_USER pause
+        self.code_delivered = False  # session-local; ignore stale memory fences
+        self.last_code_path: str | None = None
 
         if self.debug:
             print(
@@ -1009,10 +1470,11 @@ class CatSeekR1MiniAGI:
 
     def _think_heuristic(self):
         q = self.objective.lower()
-        ctx = self._context().lower()
-        already_coded = "write_code" in ctx and "```" in ctx
+        coding = BitNetCoder.is_coding_request(self.objective)
+        # Only trust code produced in THIS run — stale memory used to skip write_code.
+        already_coded = self.code_delivered and "```" in (self.last_observation or "")
 
-        if self.step == 1:
+        if self.step == 1 and not coding:
             self.thought = (
                 f"Organize objective using BitNet agent_model={self.agent_model} "
                 f"({self.engine.backend}); memory budgets ctx={self.max_context_size}."
@@ -1028,18 +1490,23 @@ class CatSeekR1MiniAGI:
             )
             return
 
-        if BitNetCoder.is_coding_request(self.objective) and not already_coded:
-            self.thought = "Coding objective — use write_code (BitNet coder)."
+        # Coding objectives: write_code immediately (skip memorize so output isn't lost).
+        if coding and not already_coded:
+            self.thought = "Coding objective — write_code and print result to terminal."
             self.proposed_command = "write_code"
             self.proposed_arg = self.objective
-            if self.prompt_user:
-                self.pending_user_gate = True
+            # Do not pause for PROMPT_USER — user asked for terminal code output.
+            self.pending_user_gate = False
             return
 
-        if already_coded or (self.last_observation and "```" in self.last_observation):
-            self.thought = "Result ready — send done."
+        if already_coded:
+            self.thought = "Code printed — send done."
             self.proposed_command = "done"
-            self.proposed_arg = self.last_observation or "Objective complete."
+            path = self.last_code_path or "(see terminal)"
+            self.proposed_arg = (
+                f"Code delivered to terminal and saved at {path}.\n"
+                f"{_clip(self.last_observation, 1200)}"
+            )
             return
 
         if any(w in q for w in ("who are you", "hello", "hi", "hey")) and len(q.split()) <= 4:
@@ -1057,6 +1524,7 @@ class CatSeekR1MiniAGI:
             self.proposed_arg = self.last_observation or "Reached MAX_STEPS."
             return
 
+        ctx = self._context().lower()
         if "memorize_thoughts" not in ctx:
             self.thought = "Internal plan before answering."
             self.proposed_command = "memorize_thoughts"
@@ -1075,8 +1543,13 @@ class CatSeekR1MiniAGI:
     def think(self):
         self.step += 1
         self.pending_user_gate = False
-        ctx = self._context()
 
+        # Coding path is deterministic — never let a live/stub planner skip write_code.
+        if BitNetCoder.is_coding_request(self.objective) and not self.code_delivered:
+            self._think_heuristic()
+            return
+
+        ctx = self._context()
         # Live BitNet planner (same model stack as microsoft/BitNet).
         if self.engine.is_live and self.step > 1:
             n_tok = max(64, int(self.params.bitnet_n_predict * (self.reasoning_effort / 100.0)))
@@ -1084,6 +1557,7 @@ class CatSeekR1MiniAGI:
                 f"Objective: {self.objective}\n"
                 f"Step: {self.step}/{self.max_steps}\n"
                 f"FILES_OFF={self.files_off}\n"
+                f"code_delivered={self.code_delivered}\n"
                 f"Last observation:\n{_clip(self.last_observation, 800)}\n\n"
                 f"Context:\n{ctx}\n\n"
                 "Return the next MiniAGI action as JSON."
@@ -1098,10 +1572,17 @@ class CatSeekR1MiniAGI:
                 obj = _extract_json_object(raw) or {}
                 cmd = str(obj.get("command") or "").strip()
                 if cmd in ALL_COMMANDS:
+                    # Never allow premature done before code is delivered on coding tasks.
+                    if cmd == "done" and BitNetCoder.is_coding_request(self.objective) and not self.code_delivered:
+                        cmd = "write_code"
+                        obj["arg"] = self.objective
+                        obj["thought"] = "Override: must write_code before done."
                     self.thought = str(obj.get("thought") or f"BitNet({self.engine.backend}) plan")
                     self.proposed_command = cmd
                     self.proposed_arg = str(obj.get("arg") or "")
-                    if self.prompt_user and cmd in {"write_code", "answer", "execute_python", "execute_shell"}:
+                    if cmd == "write_code":
+                        self.pending_user_gate = False
+                    elif self.prompt_user and cmd in {"answer", "execute_python", "execute_shell"}:
                         self.pending_user_gate = True
                     return
             except Exception as exc:  # noqa: BLE001
@@ -1195,6 +1676,9 @@ class CatSeekR1MiniAGI:
 
         if command == "write_code":
             obs = self.coder.synthesize(arg or self.objective)
+            obs, path = self.coder.deliver(self.objective, obs)
+            self.code_delivered = True
+            self.last_code_path = str(path) if path else None
             self._summarize(f"{command}\n{arg}", obs)
             self.last_observation = obs
             self.criticism = ""
@@ -1540,10 +2024,17 @@ class CatSeekGUI(tk.Tk):
             self._append("SYSTEM", f"WORK_DIR error: {exc}")
 
         self.agent = CatSeekR1MiniAGI(objective, params)
-        self.agent.restore_memory(
-            self.memory.data.get("summarized_history") or "",
-            list(self.memory.data.get("action_memory") or []),
-        )
+        # Fresh session for coding objectives so stale ``` memory cannot skip write_code.
+        if BitNetCoder.is_coding_request(objective):
+            self.agent.restore_memory("", [])
+            self.memory.data["summarized_history"] = ""
+            self.memory.data["action_memory"] = []
+            self.memory.save()
+        else:
+            self.agent.restore_memory(
+                self.memory.data.get("summarized_history") or "",
+                list(self.memory.data.get("action_memory") or []),
+            )
         self.running = True
         self._awaiting_prompt_user = False
         self.run_btn.configure(state="disabled")
@@ -1559,7 +2050,7 @@ class CatSeekGUI(tk.Tk):
             f"MODEL={params.agent_model} SUMMARIZER={params.summarizer_model} "
             f"MAX_CONTEXT_SIZE={params.max_context_size} ENABLE_CRITIC={params.enable_critic} "
             f"PROMPT_USER={params.prompt_user} WORK_DIR={params.work_dir} "
-            f"FILES_OFF={params.files_off}",
+            f"FILES_OFF={params.files_off} · code prints to terminal on write_code",
         )
         threading.Thread(target=self._agent_loop, daemon=True).start()
 
@@ -1661,6 +2152,8 @@ class CatSeekGUI(tk.Tk):
                         continue
 
                 result = self.agent.act()
+                if result.get("command") == "write_code":
+                    self.events.put(("code", result.get("observation") or ""))
                 self.events.put(("result", result))
                 if result["action"] in {"ASK", "DONE"}:
                     break
@@ -1683,6 +2176,8 @@ class CatSeekGUI(tk.Tk):
                     self.continue_btn.configure(state="normal")
                 elif kind == "user_feedback":
                     self._append("FEEDBACK", str(value))
+                elif kind == "code":
+                    self._append("CODE", value)
                 elif kind == "result":
                     self._append(str(value.get("command", "cmd")).upper(), value.get("observation") or "")
                     self._persist_agent()
