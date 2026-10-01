@@ -1,0 +1,12 @@
+.env
+.env.local
+*.pyc
+__pycache__/
+.DS_Store
+work/
+models/
+*.gguf
+.venv/
+venv/
+*.tmp
+.catr1-miniagi/
